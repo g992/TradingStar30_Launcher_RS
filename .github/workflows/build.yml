@@ -179,11 +179,10 @@ jobs:
             await github.rest.repos.updateRelease({
               owner,
               repo,
-              release_id: process.env.RELEASE_ID, # Используем ID из needs
+              release_id: process.env.RELEASE_ID,
               draft: false
             });
             console.log(`Published release for commit ${{ github.sha }}`);
         env:
-          RELEASE_ID: ${{ needs.create_release.outputs.release_id }} # Передаем ID релиза
-          # GITHUB_SHA больше не нужен для поиска, но можно оставить для логгирования, если хочется
+          RELEASE_ID: ${{ needs.create_release.outputs.release_id }}
           # GITHUB_SHA: ${{ github.sha }}
