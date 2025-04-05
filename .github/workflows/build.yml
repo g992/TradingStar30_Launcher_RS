@@ -15,18 +15,19 @@ env:
 
 # Разрешения для GitHub Token
 permissions:
-  contents: read # По умолчанию читаем контент
+  # Оставляем только contents: write на верхнем уровне
+  contents: write
+  # releases: write
 
 jobs:
   create_release:
-    name: Create Release Draft
+    name: Create Release
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Запускаем только при пуше в master
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Нужно право на запись для создания релиза
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }} # Передаем URL для загрузки ассетов
-      release_id: ${{ steps.create_release.outputs.id }} # Передаем ID релиза
+      # Убираем upload_url и release_id, оставляем только тег
+      # upload_url: ${{ steps.create_release.outputs.upload_url }}
+      # release_id: ${{ steps.create_release.outputs.id }}
       release_tag: ${{ steps.get_next_tag.outputs.next_tag }} # Передаем вычисленный тег
     steps:
       # Шаг для вычисления следующего тега версии
@@ -64,30 +65,31 @@ jobs:
               } else {
                 // При других ошибках прерываем работу
                 console.error('Error fetching latest release:', error);
-                core.setFailed(`Failed to get latest release: ${error.message}`);
                 return;
               }
             }
-            // Передаем вычисленный тег в output шага
-            core.setOutput('next_tag', nextTag);
+            // Записываем вычисленный тег в GITHUB_OUTPUT
+            console.log(`Setting output next_tag=${nextTag}`);
+            const githubOutput = process.env.GITHUB_OUTPUT;
+            if (githubOutput) {
+              require('fs').appendFileSync(githubOutput, `next_tag=${nextTag}\n`);
+            } else {
+              console.error('GITHUB_OUTPUT environment variable not set.');
+              core.setFailed('Failed to set output variable.');
+            }
 
-      - name: Create Release Draft
-        id: create_release
-        uses: actions/create-release@v1
+      # Новый шаг: Создаем опубликованный релиз с помощью gh CLI
+      - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # Используем вычисленный тег
-          tag_name: ${{ steps.get_next_tag.outputs.next_tag }}
-          # Имя релиза теперь включает версию
-          release_name: Release ${{ steps.get_next_tag.outputs.next_tag }}
-          # Исправляем многострочный body
-          body: |
-            Автоматически сгенерированный релиз для коммита ${{ github.sha }}.
-
-            **Важно:** Это черновик релиза. Отредактируйте описание при необходимости и опубликуйте вручную.
-          draft: true # Создаем как черновик
-          prerelease: false # Не пре-релиз
+          TAG: ${{ steps.get_next_tag.outputs.next_tag }}
+        run: |
+          gh release create "$TAG" \
+             --repo "$GITHUB_REPOSITORY" \
+             --title "Release $TAG" \
+             --notes "Автоматически сгенерированный релиз для коммита ${{ github.sha }}." \
+             --draft=false \
+             --prerelease=false
 
   build_release_assets:
     name: Build Release Asset (${{ matrix.os }})
@@ -176,37 +178,30 @@ jobs:
           echo "Categories=Utility;Network;" >> "$DESKTOP_FILE"
           echo "Copied icon and created .desktop file"
 
-      # 7. Загрузка ассетов в релиз (только при пуше в master)
+      # 7. Загрузка ассетов в релиз с помощью gh CLI (только при пуше в master)
       - name: Upload Binary Asset
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master
-        uses: actions/upload-release-asset@v1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: staging/${{ matrix.binary_name }}
-          # Имя ассета теперь использует тег версии и корректно добавляет .exe для Windows
-          asset_name: ${{ env.CRATE_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.platform_suffix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
-          asset_content_type: application/octet-stream
+          TAG: ${{ env.RELEASE_TAG }} # Используем тег из env
+          ASSET_PATH: staging/${{ matrix.binary_name }}
+          ASSET_NAME: ${{ env.CRATE_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.platform_suffix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+        run: |
+          gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+          # Используем `--clobber`, чтобы перезаписать файл, если он уже существует (на случай перезапуска workflow)
 
       - name: Upload Desktop File (Linux)
-        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master на Linux
-        uses: actions/upload-release-asset@v1
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: staging/${{ env.CRATE_NAME }}.desktop
-          asset_name: ${{ env.CRATE_NAME }}.desktop
-          asset_content_type: application/x-desktop
+          TAG: ${{ env.RELEASE_TAG }}
+          ASSET_PATH: staging/${{ env.CRATE_NAME }}.desktop
+        run: gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Upload Icon File (Linux)
-        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master на Linux
-        uses: actions/upload-release-asset@v1
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: staging/${{ matrix.icon_name }}
-          asset_name: ${{ matrix.icon_name }}
-          asset_content_type: image/png
+          TAG: ${{ env.RELEASE_TAG }}
+          ASSET_PATH: staging/${{ matrix.icon_name }}
+        run: gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
