@@ -1,422 +1,108 @@
-use ansi_parser::{AnsiParser, AnsiSequence, Output};
-use directories_next::ProjectDirs;
+// src/main.rs
+// Объявляем модули нашего приложения
+mod process;
+mod settings;
+mod ui;
+
+// Импортируем необходимые элементы из стандартной библиотеки и внешних крейтов
 use iced::executor;
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::container;
 use iced::{
-    advanced::subscription::{EventStream, Recipe},
-    advanced::Hasher,
-    event::{self, Status},
-    futures::stream::{BoxStream, StreamExt},
-    theme, window, Alignment, Application, Background, Border, Color, Command, Element, Event,
-    Length, Settings, Subscription, Theme,
+    clipboard, event,
+    window::{self, icon},
+    Alignment, Application, Color, Command, Element, Event, Length, Settings, Subscription, Theme,
 };
-use rfd::AsyncFileDialog;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::VecDeque,
-    hash::{Hash, Hasher as StdHasher},
-    io,
-    path::PathBuf,
-    process::Stdio,
-};
-use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command as TokioCommand};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use image;
+use rfd::AsyncFileDialog; // Для диалога выбора файла
+use std::{collections::VecDeque, path::PathBuf}; // Для очереди логов и путей // Добавляем image
 
-// --- Константы ---
-const MAX_LOG_LINES: usize = 500;
-const CONFIG_FILE_NAME: &str = "launcher_settings.json";
-const BUTTON_TEXT_COLOR: Color = Color::WHITE;
-
-// --- Структура для хранения настроек ---
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AppSettings {
-    executable_path: Option<PathBuf>,
-    api_key: String,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        AppSettings {
-            executable_path: None,
-            api_key: String::new(),
-        }
-    }
-}
-
-// --- Структура для сегмента ANSI ---
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnsiSegment {
-    text: String,
-    color: Option<Color>,
-    // Можно добавить другие атрибуты стиля (жирный, подчеркнутый), если нужно
-}
+// Импортируем элементы из наших модулей
+use process::{kill_process, ProcessListener}; // Функции и типы для работы с процессом
+use settings::{get_config_path, load_settings, save_settings, AppSettings}; // Функции и типы для настроек
+use ui::{add_log_impl, view_main, view_settings, AnsiSegment, MAX_LOG_LINES}; // Функции, типы и константы UI
 
 // --- Состояние приложения ---
+// Основная структура, хранящая все состояние лаунчера
 pub struct Launcher {
-    settings: AppSettings,
-    is_running: bool,
-    logs: VecDeque<Vec<AnsiSegment>>,
-    show_settings: bool,
-    config_path: Option<PathBuf>,
-    subscription_id_counter: u64,
-    subscription_id: Option<u64>,
-    actual_pid: Option<u32>,
-    close_requested: bool,
+    settings: AppSettings,            // Текущие настройки (путь, ключ API)
+    is_running: bool,                 // Запущен ли дочерний процесс?
+    logs: VecDeque<Vec<AnsiSegment>>, // Очередь логов (каждая строка - вектор сегментов)
+    show_settings: bool,              // Показывать ли экран настроек?
+    config_path: Option<PathBuf>,     // Путь к файлу конфигурации
+    subscription_id_counter: u64,     // Счетчик для генерации ID подписок на процесс
+    subscription_id: Option<u64>,     // Текущий ID активной подписки на процесс
+    actual_pid: Option<u32>,          // PID запущенного дочернего процесса
+    close_requested: bool,            // Был ли запрошен выход из приложения?
 }
 
 // --- Сообщения для обновления состояния ---
+// Перечисление всех возможных событий, которые могут изменить состояние приложения
 #[derive(Debug, Clone)]
 pub enum Message {
-    SettingsButtonPressed,
-    StartButtonPressed,
-    StopButtonPressed,
-    SelectExecutablePath,
-    ApiKeyChanged(String),
-    CloseSettingsPressed,
-    ExecutablePathSelected(Result<Option<PathBuf>, String>),
-    SettingsLoaded(Result<AppSettings, String>),
-    SettingsSaved(Result<(), String>),
-    ProcessActualPid(u32),
-    ProcessOutput(String),
-    ProcessTerminated(i32),
-    ProcessError(String),
-    ProcessKillResult(Result<(), String>),
-    EventOccurred(iced::Event),
+    // UI События
+    SettingsButtonPressed, // Нажата кнопка "Настройки"
+    StartButtonPressed,    // Нажата кнопка "Запуск"
+    StopButtonPressed,     // Нажата кнопка "Остановка"
+    SelectExecutablePath,  // Нажата кнопка выбора пути
+    ApiKeyChanged(String), // Изменился текст в поле API ключа
+    CloseSettingsPressed,  // Нажата кнопка "Закрыть настройки"
+    CopyLogsPressed,       // Нажата кнопка копирования логов
+
+    // События выбора файла
+    ExecutablePathSelected(Result<Option<PathBuf>, String>), // Результат выбора файла
+
+    // События загрузки/сохранения настроек
+    SettingsLoaded(Result<AppSettings, String>), // Результат загрузки настроек
+    SettingsSaved(Result<(), String>),           // Результат сохранения настроек
+
+    // События дочернего процесса (из ProcessListener)
+    ProcessActualPid(u32),  // Получен PID запущенного процесса
+    ProcessOutput(String),  // Получена строка вывода (stdout/stderr)
+    ProcessTerminated(i32), // Процесс завершился (с кодом)
+    ProcessError(String),   // Произошла ошибка, связанная с процессом
+
+    // События завершения асинхронных команд
+    ProcessKillResult(Result<(), String>), // Результат попытки остановить процесс (по кнопке/закрытию)
+    PreLaunchKillResult(Result<(), String>, Option<PathBuf>, String), // Результат попытки убить старый PID перед запуском
+    InitialPidKillResult(Result<(), String>), // <--- НОВОЕ: Результат попытки убить PID при запуске приложения
+
+    // Общие события Iced (включая закрытие окна)
+    EventOccurred(iced::Event), // Произошло событие Iced (движение мыши, нажатие клавиш, закрытие окна и т.д.)
 }
 
-// --- Функции для работы с конфигурацией ---
-fn get_config_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "TradingStar", "TradingStar3Launcher").map(|dirs| {
-        let config_dir = dirs.config_dir();
-        config_dir.join(CONFIG_FILE_NAME)
-    })
-}
-
-async fn load_settings(path: Option<PathBuf>) -> Result<AppSettings, String> {
-    let path = path.ok_or_else(|| "Не удалось определить путь к конфигурации".to_string())?;
-    if !path.exists() {
-        return Ok(AppSettings::default());
-    }
-    let content = fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("Ошибка чтения файла конфигурации {:?}: {}", path, e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Ошибка парсинга файла конфигурации {:?}: {}", path, e))
-}
-
-async fn save_settings(path: Option<PathBuf>, settings: AppSettings) -> Result<(), String> {
-    let path = path.ok_or_else(|| "Не удалось определить путь к конфигурации".to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("Не удалось создать директорию {:?}: {}", parent, e))?;
-    }
-    let content = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Ошибка сериализации настроек: {}", e))?;
-    let mut file = fs::File::create(&path).await.map_err(|e| {
-        format!(
-            "Не удалось создать/открыть файл конфигурации {:?}: {}",
-            path, e
-        )
-    })?;
-    file.write_all(content.as_bytes())
-        .await
-        .map_err(|e| format!("Не удалось записать в файл конфигурации {:?}: {}", path, e))?;
-    Ok(())
-}
-
+// --- Асинхронная функция выбора файла ---
+// (Оставлена здесь, т.к. тесно связана с UI событием SelectExecutablePath)
 async fn select_executable_file() -> Result<Option<PathBuf>, String> {
+    // Используем rfd для открытия системного диалога выбора файла
     let file_handle = AsyncFileDialog::new()
         .set_title("Выберите исполняемый файл...")
-        .set_directory("/")
-        .pick_file()
-        .await;
+        // .set_directory("/") // Можно указать начальную директорию
+        .pick_file() // Выбираем один файл
+        .await; // Ожидаем выбора пользователя
 
+    // Возвращаем путь к файлу или None, если выбор отменен
     match file_handle {
         Some(handle) => Ok(Some(handle.path().to_path_buf())),
         None => Ok(None),
     }
 }
 
-async fn kill_process(pid: u32) -> Result<(), String> {
-    println!("[kill_process] Попытка завершить процесс с PID: {}", pid);
-
-    #[cfg(unix)]
-    {
-        println!("[kill_process] Выполнение команды: kill {}", pid);
-        let kill_cmd = TokioCommand::new("kill")
-            .arg(pid.to_string())
-            .output() // Используем output() чтобы получить stdout/stderr и статус
-            .await;
-        match kill_cmd {
-            Ok(output) => {
-                println!("[kill_process] Статус kill: {}", output.status);
-                if !output.stdout.is_empty() {
-                    println!(
-                        "[kill_process] kill stdout: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                }
-                if !output.stderr.is_empty() {
-                    println!(
-                        "[kill_process] kill stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                if output.status.success() {
-                    println!(
-                        "[kill_process] Команда kill успешно завершена для PID: {}",
-                        pid
-                    );
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Команда kill для PID {} завершилась с кодом: {}. Stderr: {}",
-                        pid,
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr)
-                    ))
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("Ошибка выполнения команды kill для PID {}: {}", pid, e);
-                println!("[kill_process] {}", error_msg);
-                Err(error_msg)
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        println!(
-            "[kill_process] Выполнение команды: taskkill /F /PID {}",
-            pid
-        );
-        let kill_cmd = TokioCommand::new("taskkill")
-            .arg("/F")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .output() // Используем output()
-            .await;
-
-        match kill_cmd {
-            Ok(output) => {
-                println!("[kill_process] Статус taskkill: {}", output.status);
-                if !output.stdout.is_empty() {
-                    println!(
-                        "[kill_process] taskkill stdout: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                }
-                if !output.stderr.is_empty() {
-                    println!(
-                        "[kill_process] taskkill stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                if output.status.success() {
-                    // На Windows taskkill может вернуть успех, даже если процесс уже не существует
-                    // Проверяем stdout на наличие сообщения об успехе
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-                    if stdout.contains(&format!("pid {} ", pid)) || stdout.contains("success") {
-                        println!(
-                            "[kill_process] Команда taskkill успешно завершена для PID: {}",
-                            pid
-                        );
-                        Ok(())
-                    } else {
-                        // Возможно, процесс уже был завершен до вызова taskkill
-                        println!("[kill_process] taskkill stdout не содержит подтверждения успеха для PID {}. Возможно, процесс уже был завершен.", pid);
-                        // Считаем это успехом, так как цель - чтобы процесса не было
-                        Ok(())
-                    }
-                } else {
-                    Err(format!(
-                        "Команда taskkill для PID {} завершилась с кодом: {}. Stderr: {}",
-                        pid,
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr)
-                    ))
-                }
-            }
-            Err(e) => {
-                let error_msg =
-                    format!("Ошибка выполнения команды taskkill для PID {}: {}", pid, e);
-                println!("[kill_process] {}", error_msg);
-                Err(error_msg)
-            }
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let error_msg = "Остановка процесса не поддерживается на этой ОС.".to_string();
-        println!("[kill_process] {}", error_msg);
-        Err(error_msg)
-    }
-}
-
-// --- Вспомогательная функция для конвертации ANSI цвета ---
-fn ansi_to_iced_color(code: u8) -> Color {
-    match code {
-        // Стандартные цвета
-        30 => Color::BLACK,                       // Black
-        31 => Color::from_rgb8(0xCD, 0x5C, 0x5C), // Red (IndianRed)
-        32 => Color::from_rgb8(0x90, 0xEE, 0x90), // Green (LightGreen)
-        33 => Color::from_rgb8(0xFF, 0xD7, 0x00), // Yellow (Gold)
-        34 => Color::from_rgb8(0x46, 0x82, 0xB4), // Blue (SteelBlue)
-        35 => Color::from_rgb8(0xBA, 0x55, 0xD3), // Magenta (MediumOrchid)
-        36 => Color::from_rgb8(0x40, 0xE0, 0xD0), // Cyan (Turquoise)
-        37 => Color::from_rgb8(0xD3, 0xD3, 0xD3), // White (LightGray)
-        // Яркие цвета (часто используются)
-        90 => Color::from_rgb8(0x80, 0x80, 0x80), // Bright Black (Gray)
-        91 => Color::from_rgb8(0xFF, 0x00, 0x00), // Bright Red
-        92 => Color::from_rgb8(0x00, 0xFF, 0x00), // Bright Green (Lime)
-        93 => Color::from_rgb8(0xFF, 0xFF, 0x00), // Bright Yellow
-        94 => Color::from_rgb8(0x00, 0x00, 0xFF), // Bright Blue
-        95 => Color::from_rgb8(0xFF, 0x00, 0xFF), // Bright Magenta (Fuchsia)
-        96 => Color::from_rgb8(0x00, 0xFF, 0xFF), // Bright Cyan (Aqua)
-        97 => Color::WHITE,                       // Bright White
-        // Сброс (используем цвет по умолчанию - None в AnsiSegment)
-        0 | 39 | 49 => Color::WHITE, // Treat reset like default terminal color
-        // Другие коды пока игнорируем или возвращаем белый
-        _ => Color::WHITE,
-    }
-}
-
-// --- ProcessListener Recipe ---
-#[derive(Debug)]
-struct ProcessListener {
-    id: u64,
-    path: PathBuf,
-    api_key: String,
-}
-impl ProcessListener {
-    fn new(id: u64, path: PathBuf, api_key: String) -> Self {
-        Self { id, path, api_key }
-    }
-}
-impl Recipe for ProcessListener {
-    type Output = Message;
-
-    fn hash(&self, state: &mut Hasher) {
-        std::any::TypeId::of::<Self>().hash(state);
-        self.id.hash(state);
-    }
-
-    fn stream(self: Box<Self>, _input: EventStream) -> BoxStream<'static, Self::Output> {
-        let (sender, receiver) = mpsc::channel(100);
-
-        let path = self.path;
-        let api_key = self.api_key;
-
-        tokio::spawn(async move {
-            let mut child: Child;
-            let actual_pid: u32;
-            match TokioCommand::new(&path)
-                .arg("-k")
-                .arg(&api_key)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-            {
-                Ok(spawned_child) => {
-                    child = spawned_child;
-                    if let Some(pid) = child.id() {
-                        actual_pid = pid;
-                        if sender
-                            .send(Message::ProcessActualPid(actual_pid))
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("[Recipe] Failed to send actual PID");
-                            return;
-                        }
-                    } else {
-                        let _ = sender
-                            .send(Message::ProcessError(
-                                "Не удалось получить PID запущенного процесса.".to_string(),
-                            ))
-                            .await;
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = sender
-                        .send(Message::ProcessError(format!(
-                            "Ошибка запуска процесса {:?}: {}",
-                            path, e
-                        )))
-                        .await;
-                    return;
-                }
-            }
-
-            let stdout = child.stdout.take().expect("stdout not captured");
-            let stderr = child.stderr.take().expect("stderr not captured");
-
-            let sender_stdout = sender.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    if sender_stdout
-                        .send(Message::ProcessOutput(line))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            let sender_stderr = sender.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    if sender_stderr
-                        .send(Message::ProcessOutput(format!("STDERR: {}", line)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            let sender_termination = sender;
-            tokio::spawn(async move {
-                let message = match child.wait().await {
-                    Ok(status) => Message::ProcessTerminated(status.code().unwrap_or(-1)),
-                    Err(e) => Message::ProcessError(format!(
-                        "Ошибка ожидания процесса PID {}: {}",
-                        actual_pid, e
-                    )),
-                };
-                let _ = sender_termination.send(message).await;
-            });
-        });
-
-        ReceiverStream::new(receiver).boxed()
-    }
-}
-
-// --- Реализация Application ---
+// --- Реализация трейта Application для Iced ---
 impl Application for Launcher {
-    type Executor = executor::Default;
-    type Message = Message;
-    type Theme = Theme;
-    type Flags = ();
+    type Executor = executor::Default; // Стандартный исполнитель Tokio
+    type Message = Message; // Тип сообщений нашего приложения
+    type Theme = Theme; // Используем стандартные темы Iced
+    type Flags = (); // Флаги инициализации (не используем)
 
+    // Инициализация приложения
     fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+        // Получаем путь к конфигурации
         let config_path = get_config_path();
+        // Создаем начальное состояние
         let initial_state = Launcher {
-            settings: AppSettings::default(),
+            settings: AppSettings::default(), // Настройки по умолчанию
             is_running: false,
-            logs: VecDeque::with_capacity(MAX_LOG_LINES),
+            logs: VecDeque::with_capacity(MAX_LOG_LINES), // Пустая очередь логов
             show_settings: false,
             config_path: config_path.clone(),
             subscription_id_counter: 0,
@@ -424,46 +110,64 @@ impl Application for Launcher {
             actual_pid: None,
             close_requested: false,
         };
+        // Возвращаем состояние и команду на загрузку настроек
         (
             initial_state,
+            // Запускаем асинхронную загрузку настроек
             Command::perform(load_settings(config_path), Message::SettingsLoaded),
         )
     }
 
+    // Заголовок окна приложения
     fn title(&self) -> String {
         String::from("TradingStar 3 Launcher")
     }
 
+    // Обновление состояния приложения при получении сообщения
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
-        let mut commands_to_batch = vec![];
+        let mut commands_to_batch = vec![]; // Вектор для команд, которые нужно выполнить
 
         match message {
-            Message::SettingsLoaded(Ok(loaded_settings)) => {
-                self.settings = loaded_settings;
-            }
-            Message::SettingsLoaded(Err(e)) => {
-                eprintln!("Ошибка загрузки настроек: {}", e);
-                self.add_log(format!("Ошибка загрузки настроек: {}", e));
-                self.settings = AppSettings::default();
-            }
-            Message::SettingsButtonPressed => {
-                self.show_settings = true;
-            }
-            Message::CloseSettingsPressed => {
-                self.show_settings = false;
-            }
+            // --- Обработка событий UI ---
+            Message::SettingsButtonPressed => self.show_settings = true, // Показать настройки
+            Message::CloseSettingsPressed => self.show_settings = false, // Скрыть настройки
             Message::StartButtonPressed => {
-                if self.is_running {
-                    return Command::none();
-                }
-                if self.settings.executable_path.is_some() && !self.settings.api_key.is_empty() {
-                    self.logs.clear();
-                    self.add_log("Запуск процесса через подписку...".to_string());
-                    self.is_running = true;
-                    let new_id = self.subscription_id_counter;
-                    self.subscription_id_counter += 1;
-                    self.subscription_id = Some(new_id);
-                    self.actual_pid = None;
+                // Проверяем, можно ли запустить
+                if !self.is_running
+                    && self.settings.executable_path.is_some()
+                    && !self.settings.api_key.is_empty()
+                {
+                    let path = self.settings.executable_path.clone().unwrap(); // Безопасно, т.к. проверили is_some()
+                    let api_key = self.settings.api_key.clone();
+
+                    // Проверяем, есть ли старый PID
+                    if let Some(last_pid) = self.settings.last_pid {
+                        self.add_log(format!(
+                            "Обнаружен PID предыдущего запуска: {}. Попытка завершения...",
+                            last_pid
+                        ));
+                        // Пытаемся убить старый процесс и передаем path/api_key для последующего запуска
+                        commands_to_batch.push(Command::perform(
+                            kill_process(last_pid),
+                            move |result| Message::PreLaunchKillResult(result, Some(path), api_key), // Передаем path и api_key
+                        ));
+                    } else {
+                        // Старого PID нет, запускаем сразу
+                        self.logs.clear();
+                        self.add_log("Запуск процесса через подписку...".to_string());
+                        self.is_running = true;
+                        let new_id = self.subscription_id_counter;
+                        self.subscription_id_counter += 1;
+                        self.subscription_id = Some(new_id);
+                        self.actual_pid = None; // Сбрасываем, ждем новый PID от подписки
+                                                // Сохраняем настройки (на всякий случай, хотя PID еще не установлен)
+                        commands_to_batch.push(Command::perform(
+                            save_settings(self.config_path.clone(), self.settings.clone()),
+                            Message::SettingsSaved,
+                        ));
+                    }
+                } else if self.is_running {
+                    // Игнорируем, если уже запущен
                 } else {
                     self.add_log("Ошибка: Проверьте путь и ключ API.".to_string());
                 }
@@ -473,19 +177,131 @@ impl Application for Launcher {
                     self.add_log(format!("Остановка процесса (PID: {})...", pid));
                     self.is_running = false;
                     self.subscription_id = None;
+                    // Очищаем сохраненный PID и сохраняем настройки
+                    if self.settings.last_pid.is_some() {
+                        self.settings.last_pid = None;
+                        commands_to_batch.push(Command::perform(
+                            save_settings(self.config_path.clone(), self.settings.clone()),
+                            Message::SettingsSaved,
+                        ));
+                    }
                     commands_to_batch.push(Command::perform(
                         kill_process(pid),
                         Message::ProcessKillResult,
                     ));
                 } else {
                     self.add_log("Процесс не запущен или PID неизвестен.".to_string());
+                    // На всякий случай очищаем и сохраняем, если PID был, а is_running - нет
+                    if self.settings.last_pid.is_some() {
+                        self.settings.last_pid = None;
+                        commands_to_batch.push(Command::perform(
+                            save_settings(self.config_path.clone(), self.settings.clone()),
+                            Message::SettingsSaved,
+                        ));
+                    }
                     self.is_running = false;
                     self.subscription_id = None;
                 }
             }
+            Message::SelectExecutablePath => {
+                // Запускаем асинхронный диалог выбора файла
+                // Используем return, т.к. это единственная команда
+                return Command::perform(select_executable_file(), Message::ExecutablePathSelected);
+            }
+            Message::ApiKeyChanged(new_key) => {
+                // Обновляем ключ API и запускаем сохранение настроек
+                self.settings.api_key = new_key;
+                commands_to_batch.push(Command::perform(
+                    save_settings(self.config_path.clone(), self.settings.clone()),
+                    Message::SettingsSaved,
+                ));
+            }
+            Message::CopyLogsPressed => {
+                // Собираем все сегменты всех строк лога в единый текст
+                let log_text = self
+                    .logs
+                    .iter()
+                    .rev() // Итерируем от новых к старым
+                    .map(|line_segments| {
+                        // Для каждой строки
+                        line_segments
+                            .iter()
+                            .map(|segment| segment.text.as_str()) // Берем текст сегмента
+                            .collect::<String>() // Собираем сегменты строки в одну String
+                    })
+                    .collect::<Vec<String>>() // Собираем все строки в Vec<String>
+                    .join("\n"); // Объединяем строки через перевод строки
+
+                if !log_text.is_empty() {
+                    // Записываем собранный текст в буфер обмена
+                    commands_to_batch.push(clipboard::write(log_text));
+                    self.add_log("Логи скопированы в буфер обмена.".to_string());
+                } else {
+                    self.add_log("Нет логов для копирования.".to_string());
+                }
+            }
+
+            // --- Обработка событий выбора файла ---
+            Message::ExecutablePathSelected(Ok(Some(path))) => {
+                // Путь выбран, обновляем настройки и сохраняем
+                self.settings.executable_path = Some(path.clone());
+                self.add_log(format!("Выбран путь: {:?}", path));
+                commands_to_batch.push(Command::perform(
+                    save_settings(self.config_path.clone(), self.settings.clone()),
+                    Message::SettingsSaved,
+                ));
+            }
+            Message::ExecutablePathSelected(Ok(None)) => {
+                // Выбор файла отменен
+                self.add_log("Выбор файла отменен.".to_string());
+            }
+            Message::ExecutablePathSelected(Err(e)) => {
+                // Ошибка выбора файла
+                eprintln!("Ошибка выбора файла: {}", e);
+                self.add_log(format!("Ошибка выбора файла: {}", e));
+            }
+
+            // --- Обработка событий загрузки/сохранения настроек ---
+            Message::SettingsLoaded(Ok(loaded_settings)) => {
+                self.settings = loaded_settings;
+                self.add_log("Настройки успешно загружены.".to_string());
+                // Проверяем, остался ли PID с прошлого запуска
+                if let Some(last_pid) = self.settings.last_pid {
+                    self.add_log(format!(
+                        "Обнаружен PID ({}) от предыдущего сеанса. Попытка завершения...",
+                        last_pid
+                    ));
+                    // Запускаем команду завершения старого процесса
+                    commands_to_batch.push(Command::perform(
+                        kill_process(last_pid),
+                        Message::InitialPidKillResult, // Используем новое сообщение
+                    ));
+                }
+            }
+            Message::SettingsLoaded(Err(e)) => {
+                eprintln!("Ошибка загрузки настроек: {}", e);
+                self.add_log(format!("Ошибка загрузки настроек: {}", e));
+                self.settings = AppSettings::default();
+                // В случае ошибки загрузки, last_pid будет None по умолчанию
+            }
+            Message::SettingsSaved(Ok(())) => {
+                println!("Настройки сохранены.");
+            }
+            Message::SettingsSaved(Err(e)) => {
+                eprintln!("Ошибка сохранения настроек: {}", e);
+                self.add_log(format!("Ошибка сохранения настроек: {}", e));
+            }
+
+            // --- Обработка событий дочернего процесса ---
             Message::ProcessActualPid(pid) => {
                 self.add_log(format!("Процесс успешно запущен (PID: {}).", pid));
                 self.actual_pid = Some(pid);
+                // Сохраняем новый PID в настройках
+                self.settings.last_pid = Some(pid);
+                commands_to_batch.push(Command::perform(
+                    save_settings(self.config_path.clone(), self.settings.clone()),
+                    Message::SettingsSaved,
+                ));
             }
             Message::ProcessOutput(line) => {
                 self.add_log(line);
@@ -495,6 +311,14 @@ impl Application for Launcher {
                 self.is_running = false;
                 self.subscription_id = None;
                 self.actual_pid = None;
+                // Очищаем сохраненный PID и сохраняем настройки
+                if self.settings.last_pid.is_some() {
+                    self.settings.last_pid = None;
+                    commands_to_batch.push(Command::perform(
+                        save_settings(self.config_path.clone(), self.settings.clone()),
+                        Message::SettingsSaved,
+                    ));
+                }
                 if self.close_requested {
                     commands_to_batch.push(window::close(window::Id::MAIN));
                 }
@@ -504,15 +328,27 @@ impl Application for Launcher {
                 self.is_running = false;
                 self.subscription_id = None;
                 self.actual_pid = None;
+                // Очищаем сохраненный PID и сохраняем настройки
+                if self.settings.last_pid.is_some() {
+                    self.settings.last_pid = None;
+                    commands_to_batch.push(Command::perform(
+                        save_settings(self.config_path.clone(), self.settings.clone()),
+                        Message::SettingsSaved,
+                    ));
+                }
                 if self.close_requested {
                     commands_to_batch.push(window::close(window::Id::MAIN));
                 }
             }
+
+            // --- Обработка событий завершения команд ---
             Message::ProcessKillResult(result) => {
                 match result {
                     Ok(_) => self.add_log("Команда остановки процесса отправлена.".to_string()),
                     Err(e) => self.add_log(format!("Ошибка отправки команды остановки: {}", e)),
                 }
+                // PID уже должен быть очищен и сохранен в StopButtonPressed или EventOccurred
+                // Просто сбрасываем флаги состояния
                 self.is_running = false;
                 self.subscription_id = None;
                 self.actual_pid = None;
@@ -520,66 +356,92 @@ impl Application for Launcher {
                     commands_to_batch.push(window::close(window::Id::MAIN));
                 }
             }
-            Message::SelectExecutablePath => {
-                return Command::perform(select_executable_file(), Message::ExecutablePathSelected);
-            }
-            Message::ExecutablePathSelected(Ok(Some(path))) => {
-                self.settings.executable_path = Some(path);
-                self.add_log(format!(
-                    "Выбран путь: {:?}",
-                    self.settings.executable_path.as_ref().unwrap()
-                ));
-                commands_to_batch.push(Command::perform(
-                    save_settings(self.config_path.clone(), self.settings.clone()),
-                    Message::SettingsSaved,
-                ));
-            }
-            Message::ExecutablePathSelected(Ok(None)) => {
-                self.add_log("Выбор файла отменен.".to_string());
-            }
-            Message::ExecutablePathSelected(Err(e)) => {
-                eprintln!("Ошибка выбора файла: {}", e);
-                self.add_log(format!("Ошибка выбора файла: {}", e));
-            }
-            Message::ApiKeyChanged(new_key) => {
-                self.settings.api_key = new_key;
-                commands_to_batch.push(Command::perform(
-                    save_settings(self.config_path.clone(), self.settings.clone()),
-                    Message::SettingsSaved,
-                ));
-            }
-            Message::SettingsSaved(Ok(())) => {
-                println!("Настройки сохранены.");
-            }
-            Message::SettingsSaved(Err(e)) => {
-                eprintln!("Ошибка сохранения настроек: {}", e);
-                self.add_log(format!("Ошибка сохранения настроек: {}", e));
-            }
-            Message::EventOccurred(event) => {
-                // Лог 1: Получено ли событие вообще?
 
-                if let Event::Window(id, window::Event::CloseRequested) = event {
-                    // Лог 2: Событие - это запрос на закрытие окна?
-                    println!(
-                        "[EventOccurred] Событие - запрос на закрытие для окна ID: {:?}",
-                        id
+            // --- Обработка событий завершения команд ---
+            Message::PreLaunchKillResult(kill_result, path_opt, api_key) => {
+                match kill_result {
+                    Ok(_) => self.add_log(
+                        "Команда завершения предыдущего процесса отправлена (или он уже не существовал)."
+                            .to_string(),
+                    ),
+                    Err(e) => self.add_log(format!(
+                        "Ошибка при попытке завершить предыдущий процесс: {}",
+                        e
+                    )),
+                }
+                // Независимо от результата, пытаемся запустить новый процесс
+                // Проверки на path/api_key уже были в StartButtonPressed
+                if path_opt.is_some() && !api_key.is_empty() {
+                    self.logs.clear();
+                    self.add_log("Запуск нового процесса после попытки очистки...".to_string());
+                    self.is_running = true;
+                    let new_id = self.subscription_id_counter;
+                    self.subscription_id_counter += 1;
+                    self.subscription_id = Some(new_id);
+                    self.actual_pid = None; // Сбрасываем, ждем новый PID от подписки
+                                            // Сохраняем настройки (на всякий случай, хотя PID еще не установлен)
+                    commands_to_batch.push(Command::perform(
+                        save_settings(self.config_path.clone(), self.settings.clone()),
+                        Message::SettingsSaved,
+                    ));
+                } else {
+                    // Этого не должно произойти, если логика StartButtonPressed верна
+                    self.add_log(
+                        "Ошибка: Не удалось получить путь/ключ для запуска после очистки."
+                            .to_string(),
                     );
+                }
+            }
 
+            // --- Обработка событий завершения команд ---
+            Message::InitialPidKillResult(result) => {
+                match result {
+                    Ok(_) => self.add_log(
+                        "Команда завершения процесса от предыдущего сеанса отправлена (или он не существовал)."
+                            .to_string(),
+                    ),
+                    Err(e) => self.add_log(format!(
+                        "Ошибка при попытке завершить процесс от предыдущего сеанса: {}",
+                        e
+                    )),
+                }
+                // В любом случае очищаем last_pid в настройках и сохраняем их
+                if self.settings.last_pid.is_some() {
+                    self.settings.last_pid = None;
+                    commands_to_batch.push(Command::perform(
+                        save_settings(self.config_path.clone(), self.settings.clone()),
+                        Message::SettingsSaved,
+                    ));
+                }
+            }
+
+            // --- Обработка общих событий Iced ---
+            Message::EventOccurred(event) => {
+                if let Event::Window(id, window::Event::CloseRequested) = event {
                     if id == window::Id::MAIN {
-                        // Лог 3: Окно - главное?
                         println!(
                             "[EventOccurred] Окно - главное (MAIN). Запускаем логику закрытия."
                         );
-
-                        // --- Основная логика ---
                         self.add_log("Получен запрос на закрытие окна...".to_string());
                         self.close_requested = true;
                         if self.is_running {
                             if let Some(pid) = self.actual_pid {
+                                // Не используем .take() здесь
                                 self.add_log(format!(
                                     "Инициирована остановка процесса (PID: {}) перед закрытием.",
                                     pid
                                 ));
+                                // Очищаем сохраненный PID и сохраняем настройки
+                                if self.settings.last_pid.is_some() {
+                                    self.settings.last_pid = None;
+                                    commands_to_batch.push(Command::perform(
+                                        save_settings(
+                                            self.config_path.clone(),
+                                            self.settings.clone(),
+                                        ),
+                                        Message::SettingsSaved,
+                                    ));
+                                }
                                 commands_to_batch.push(Command::perform(
                                     kill_process(pid),
                                     Message::ProcessKillResult,
@@ -589,68 +451,90 @@ impl Application for Launcher {
                                     "Процесс был запущен, но PID не найден. Закрытие окна."
                                         .to_string(),
                                 );
+                                // На всякий случай очищаем и сохраняем, если PID был
+                                if self.settings.last_pid.is_some() {
+                                    self.settings.last_pid = None;
+                                    commands_to_batch.push(Command::perform(
+                                        save_settings(
+                                            self.config_path.clone(),
+                                            self.settings.clone(),
+                                        ),
+                                        Message::SettingsSaved,
+                                    ));
+                                }
                                 self.is_running = false;
                                 self.subscription_id = None;
                                 commands_to_batch.push(window::close(window::Id::MAIN));
                             }
                         } else {
-                            // Лог 5: Процесс не запущен при закрытии.
                             println!("[EventOccurred] Процесс не запущен. Запрос на немедленное закрытие.");
+                            // На всякий случай очищаем и сохраняем, если PID был
+                            if self.settings.last_pid.is_some() {
+                                self.settings.last_pid = None;
+                                commands_to_batch.push(Command::perform(
+                                    save_settings(self.config_path.clone(), self.settings.clone()),
+                                    Message::SettingsSaved,
+                                ));
+                            }
                             self.add_log("Процесс не запущен. Закрытие окна.".to_string());
                             commands_to_batch.push(window::close(window::Id::MAIN));
                         }
-                        // --- Конец основной логики ---
                     } else {
-                        // Лог 4: Окно не главное.
                         println!("[EventOccurred] Окно ID {:?} не является главным (MAIN). Игнорируем запрос.", id);
-                        self.add_log(format!(
-                            "Запрос на закрытие для окна {:?}, игнорируется.",
-                            id
-                        ));
                     }
                 }
-                // Если событие не Event::Window(_, window::Event::CloseRequested), оно просто игнорируется здесь
-                // Можно добавить else блок для if let, если нужно логировать и другие типы событий
             }
         }
+        // Возвращаем пакет команд для выполнения Iced
         Command::batch(commands_to_batch)
     }
 
+    // Настройка подписок на события
     fn subscription(&self) -> Subscription<Self::Message> {
+        // Подписка на общие события Iced (для перехвата закрытия окна)
         let window_events = event::listen().map(Message::EventOccurred);
 
+        // Подписка на события дочернего процесса (только если он запущен)
         let process_subscription = if self.is_running {
+            // Проверяем наличие ID подписки, пути и ключа API
             if let Some(id) = self.subscription_id {
                 if let Some(path) = self.settings.executable_path.clone() {
                     if !self.settings.api_key.is_empty() {
+                        // Создаем подписку с помощью нашего ProcessListener
                         Subscription::from_recipe(ProcessListener::new(
                             id,
                             path,
                             self.settings.api_key.clone(),
                         ))
                     } else {
-                        Subscription::none()
+                        Subscription::none() // Нет ключа API
                     }
                 } else {
-                    Subscription::none()
+                    Subscription::none() // Нет пути
                 }
             } else {
-                Subscription::none()
+                Subscription::none() // Нет ID подписки (не должно происходить, если is_running)
             }
         } else {
-            Subscription::none()
+            Subscription::none() // Процесс не запущен
         };
 
+        // Объединяем обе подписки в одну
         Subscription::batch(vec![window_events, process_subscription])
     }
 
+    // Отрисовка интерфейса приложения
     fn view(&self) -> Element<Self::Message> {
+        // Выбираем, какую функцию отрисовки вызвать из модуля ui
         let main_content = if self.show_settings {
-            self.view_settings()
+            // Передаем ссылку на настройки для отрисовки экрана настроек
+            ui::view_settings(&self.settings)
         } else {
-            self.view_main()
+            // Передаем флаг запуска, ссылку на логи и настройки для отрисовки главного экрана
+            ui::view_main(self.is_running, &self.logs, &self.settings)
         };
 
+        // Оборачиваем основной контент в контейнер для центрирования
         container(main_content)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -658,240 +542,58 @@ impl Application for Launcher {
             .into()
     }
 
+    // Тема приложения
     fn theme(&self) -> Self::Theme {
-        Theme::Dark
+        Theme::Dark // Используем темную тему
     }
 }
 
+// Реализация методов для структуры Launcher (не связанных с Application)
 impl Launcher {
+    // Метод для добавления строки лога (делегирует парсинг модулю ui)
     fn add_log(&mut self, message: String) {
-        println!("RAW LOG: {}", message);
-
-        let mut segments = Vec::new();
-        let mut current_color: Option<Color> = None;
-        let mut current_text = String::new();
-
-        for block in message.ansi_parse() {
-            match block {
-                Output::TextBlock(text) => {
-                    current_text.push_str(text);
-                }
-                Output::Escape(sequence) => {
-                    if let AnsiSequence::SetGraphicsMode(codes) = sequence {
-                        if codes.is_empty() {
-                            if !current_text.is_empty() {
-                                segments.push(AnsiSegment {
-                                    text: std::mem::take(&mut current_text),
-                                    color: current_color,
-                                });
-                            }
-                            current_color = None;
-                        } else {
-                            for code in codes {
-                                match code {
-                                    0 => {
-                                        if !current_text.is_empty() {
-                                            segments.push(AnsiSegment {
-                                                text: std::mem::take(&mut current_text),
-                                                color: current_color,
-                                            });
-                                        }
-                                        current_color = None;
-                                    }
-                                    30..=37 | 90..=97 => {
-                                        if !current_text.is_empty() {
-                                            segments.push(AnsiSegment {
-                                                text: std::mem::take(&mut current_text),
-                                                color: current_color,
-                                            });
-                                        }
-                                        current_color = Some(ansi_to_iced_color(code));
-                                    }
-                                    39 => {
-                                        if !current_text.is_empty() {
-                                            segments.push(AnsiSegment {
-                                                text: std::mem::take(&mut current_text),
-                                                color: current_color,
-                                            });
-                                        }
-                                        current_color = None;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !current_text.is_empty() {
-            segments.push(AnsiSegment {
-                text: current_text,
-                color: current_color,
-            });
-        }
-
-        segments.retain(|seg| !seg.text.is_empty());
-
-        if self.logs.len() >= MAX_LOG_LINES {
-            self.logs.pop_front();
-        }
-        if !segments.is_empty() {
-            println!("PARSED LOG: {:?}", segments);
-            self.logs.push_back(segments);
-        }
-    }
-
-    fn view_main(&self) -> Element<Message> {
-        let top_bar_content = row![
-            text("TradingStar 3 Launcher").size(20),
-            Space::with_width(Length::Fill),
-            button("Настройки")
-                .padding(10)
-                .on_press(Message::SettingsButtonPressed)
-        ]
-        .spacing(20)
-        .align_items(Alignment::Center)
-        .padding(10);
-
-        let top_bar_container = container(top_bar_content)
-            .width(Length::Fill)
-            .style(theme::Container::Custom(Box::new(TopBarStyle)));
-
-        let control_button_element = if self.is_running {
-            button("Остановка программы")
-                .padding(10)
-                .style(theme::Button::Custom(Box::new(StopButtonStyle)))
-                .on_press(Message::StopButtonPressed)
-        } else {
-            let start_button = button("Запуск программы").padding(10);
-            if self.settings.executable_path.is_some() && !self.settings.api_key.is_empty() {
-                start_button
-                    .style(theme::Button::Custom(Box::new(StartButtonStyle)))
-                    .on_press(Message::StartButtonPressed)
-            } else {
-                start_button
-            }
-        };
-
-        let control_row = row![Space::with_width(Length::Fill), control_button_element].padding(10);
-
-        let log_lines = self
-            .logs
-            .iter()
-            .fold(column![].spacing(2), |column, line_segments| {
-                let log_row = line_segments
-                    .iter()
-                    .fold(row![].spacing(0), |row_acc, segment| {
-                        let segment_text = text(&segment.text)
-                            .size(12)
-                            .font(iced::Font::MONOSPACE)
-                            .style(segment.color.unwrap_or(Color::WHITE));
-                        row_acc.push(segment_text)
-                    });
-                column.push(log_row)
-            });
-
-        let log_view = scrollable(log_lines)
-            .height(Length::Fill)
-            .width(Length::Fill);
-
-        column![top_bar_container, control_row, log_view]
-            .spacing(10)
-            .padding(0)
-            .into()
-    }
-
-    fn view_settings(&self) -> Element<Message> {
-        let path_display = match &self.settings.executable_path {
-            Some(path) => path.display().to_string(),
-            None => "Путь не выбран".to_string(),
-        };
-
-        column![
-            text("Настройки").size(24),
-            Space::with_height(20),
-            text("Путь к исполняемому файлу:"),
-            row![
-                text(path_display).width(Length::Fill),
-                button("Выбрать...")
-                    .padding(5)
-                    .on_press(Message::SelectExecutablePath)
-            ]
-            .spacing(10)
-            .align_items(Alignment::Center),
-            Space::with_height(15),
-            text("Ключ API (параметр -k):"),
-            text_input("Введите ваш API ключ...", &self.settings.api_key)
-                .on_input(Message::ApiKeyChanged)
-                .padding(10),
-            Space::with_height(Length::Fill),
-            button("Закрыть настройки")
-                .padding(10)
-                .on_press(Message::CloseSettingsPressed)
-        ]
-        .padding(20)
-        .spacing(10)
-        .max_width(600)
-        .into()
+        // Вызываем функцию парсинга и добавления из модуля ui
+        ui::add_log_impl(&mut self.logs, message);
     }
 }
 
-struct TopBarStyle;
-impl container::StyleSheet for TopBarStyle {
-    type Style = Theme;
-    fn appearance(&self, _style: &Self::Style) -> container::Appearance {
-        container::Appearance {
-            background: Some(Color::from_rgb8(0x00, 0x7B, 0xFF).into()),
-            text_color: Some(Color::WHITE),
-            ..Default::default()
-        }
-    }
-}
-
-struct StartButtonStyle;
-impl button::StyleSheet for StartButtonStyle {
-    type Style = Theme;
-
-    fn active(&self, _style: &Self::Style) -> button::Appearance {
-        button::Appearance {
-            background: Some(Background::Color(Color::from_rgb8(0x28, 0xA7, 0x45))),
-            text_color: BUTTON_TEXT_COLOR,
-            border: Border {
-                radius: 4.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-}
-
-struct StopButtonStyle;
-impl button::StyleSheet for StopButtonStyle {
-    type Style = Theme;
-
-    fn active(&self, _style: &Self::Style) -> button::Appearance {
-        button::Appearance {
-            background: Some(Background::Color(Color::from_rgb8(0xDC, 0x35, 0x45))),
-            text_color: BUTTON_TEXT_COLOR,
-            border: Border {
-                radius: 4.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-}
-
+// --- Точка входа в приложение ---
 fn main() -> iced::Result {
+    // Встраиваем байты иконки в исполняемый файл
+    // Используем путь относительно корня проекта
+    const ICON_BYTES: &[u8] = include_bytes!("assets/favicon-128x128.png");
+
+    // Загрузка иконки
+    let window_icon = match image::load_from_memory(ICON_BYTES) {
+        Ok(image) => {
+            let image = image.to_rgba8(); // Преобразуем в RGBA8
+            let (width, height) = image.dimensions();
+            let pixel_data = image.into_raw();
+            // Создаем иконку Iced
+            match icon::from_rgba(pixel_data, width, height) {
+                Ok(icon) => Some(icon),
+                Err(e) => {
+                    eprintln!("Ошибка создания иконки Iced: {}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Ошибка загрузки файла иконки: {}", e);
+            None
+        }
+    };
+
+    // Настройки окна приложения
     let settings = Settings {
         window: iced::window::Settings {
             size: iced::Size::new(800.0, 600.0),
             exit_on_close_request: false,
+            icon: window_icon, // <-- Устанавливаем иконку окна
             ..iced::window::Settings::default()
         },
         ..Settings::default()
     };
+    // Запуск приложения Iced
     Launcher::run(settings)
 }
