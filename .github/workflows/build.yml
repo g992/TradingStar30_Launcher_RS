@@ -183,25 +183,38 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ env.RELEASE_TAG }} # Используем тег из env
-          ASSET_PATH: staging/${{ matrix.binary_name }}
-          ASSET_NAME: ${{ env.CRATE_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.platform_suffix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          TAG: ${{ env.RELEASE_TAG }}
+        shell: pwsh
         run: |
-          gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
-          # Используем `--clobber`, чтобы перезаписать файл, если он уже существует (на случай перезапуска workflow)
+          if ($env:RUNNER_OS -eq 'Linux') {
+            $assetPath = "staging/${{ matrix.binary_name }}"
+          } elseif ($env:RUNNER_OS -eq 'Windows') {
+            $assetPath = "staging\${{ matrix.binary_name }}"
+          } else {
+            Write-Error "Unsupported OS for asset upload: $($env:RUNNER_OS)"
+            exit 1
+          }
+          Write-Host "Uploading binary asset from path: $assetPath"
+          gh release upload "$env:TAG" "$assetPath" --clobber --repo "$env:GITHUB_REPOSITORY"
 
       - name: Upload Desktop File (Linux)
         if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
-          ASSET_PATH: staging/${{ env.CRATE_NAME }}.desktop
-        run: gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+        shell: pwsh
+        run: |
+          $assetPath = "staging/${{ env.CRATE_NAME }}.desktop"
+          Write-Host "Uploading desktop file from path: $assetPath"
+          gh release upload "$env:TAG" "$assetPath" --clobber --repo "$env:GITHUB_REPOSITORY"
 
       - name: Upload Icon File (Linux)
         if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
-          ASSET_PATH: staging/${{ matrix.icon_name }}
-        run: gh release upload "$TAG" "$ASSET_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+        shell: pwsh
+        run: |
+          $assetPath = "staging/${{ matrix.icon_name }}"
+          Write-Host "Uploading icon file from path: $assetPath"
+          gh release upload "$env:TAG" "$assetPath" --clobber --repo "$env:GITHUB_REPOSITORY"
