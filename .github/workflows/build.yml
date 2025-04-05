@@ -26,6 +26,7 @@ jobs:
       contents: write # Нужно право на запись для создания релиза
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }} # Передаем URL для загрузки ассетов
+      release_id: ${{ steps.create_release.outputs.id }} # Передаем ID релиза
     env:
       SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
     steps:
@@ -163,7 +164,7 @@ jobs:
 
   publish_release:
     name: Publish Release
-    needs: build_release_assets # Запускаем после сборки и загрузки всех ассетов
+    needs: [create_release, build_release_assets] # Добавляем зависимость от create_release
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Запускаем только при пуше в master
     runs-on: ubuntu-latest
     permissions:
@@ -175,17 +176,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { repo, owner } = context.repo;
-            const release = await github.rest.repos.getReleaseByTag({
-              owner,
-              repo,
-              tag: process.env.GITHUB_SHA
-            });
             await github.rest.repos.updateRelease({
               owner,
               repo,
-              release_id: release.data.id,
+              release_id: process.env.RELEASE_ID, # Используем ID из needs
               draft: false
             });
-            console.log(`Published release for commit ${process.env.GITHUB_SHA}`);
+            console.log(`Published release for commit ${{ github.sha }}`);
         env:
-          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_ID: ${{ needs.create_release.outputs.release_id }} # Передаем ID релиза
+          # GITHUB_SHA больше не нужен для поиска, но можно оставить для логгирования, если хочется
+          # GITHUB_SHA: ${{ github.sha }}
