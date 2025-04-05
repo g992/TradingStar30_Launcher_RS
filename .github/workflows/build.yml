@@ -84,7 +84,7 @@ jobs:
       - name: Prepare Desktop Entry (Linux)
         if: runner.os == 'Linux'
         run: |
-          cp assets/${{ matrix.icon_name }} staging/
+          cp src/assets/${{ matrix.icon_name }} staging/
           DESKTOP_FILE="staging/${{ env.CRATE_NAME }}.desktop"
           echo "[Desktop Entry]" > "$DESKTOP_FILE"
           echo "Version=1.0" >> "$DESKTOP_FILE"
