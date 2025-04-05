@@ -1,4 +1,4 @@
-name: Build Rust Application
+name: Build and Release Rust Application
 
 # Триггеры запуска воркфлоу
 on:
@@ -13,29 +13,63 @@ env:
   # Включаем цвета в выводе Cargo
   CARGO_TERM_COLOR: always
 
+# Разрешения для GitHub Token
+permissions:
+  contents: read # По умолчанию читаем контент
+
 jobs:
-  build:
-    name: Build for ${{ matrix.os }} (${{ matrix.target }})
-    # Используем стратегию матрицы для запуска на разных ОС
+  create_release:
+    name: Create Release Draft
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Запускаем только при пуше в master
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Нужно право на запись для создания релиза
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }} # Передаем URL для загрузки ассетов
+    env:
+      SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
+    steps:
+      - name: Create Release Draft
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Используем короткий хеш коммита для тега и имени релиза, т.к. запускаемся на пуш
+          tag_name: ${{ github.sha }}
+          release_name: Release ${{ env.SHORT_SHA }}
+          body: 'Автоматически сгенерированный релиз для коммита ${{ github.sha }}' # Можно добавить генерацию changelog позже
+          draft: true # Создаем как черновик
+          prerelease: false
+
+  build_release_assets:
+    name: Build Release Asset (${{ matrix.os }})
+    needs: create_release # Запускаем после создания черновика релиза
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    env:
+      # Получаем имя ветки (master) и короткий хеш
+      BRANCH_NAME: ${{ github.ref_name }}
+      SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
     strategy:
       matrix:
         include:
           # Сборка под Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: linux-release
+            platform_suffix: linux-x86_64
             binary_name: TradingStar30_Launcher
             icon_name: favicon-256x256.png
 
           # Сборка под Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: windows-release
+            platform_suffix: windows-x86_64
             binary_name: TradingStar30_Launcher.exe
+            icon_name: null # Нет иконки/desktop файла для Windows в этом workflow
 
-    # Указываем ОС для текущего задания из матрицы
     runs-on: ${{ matrix.os }}
-
     steps:
       # 1. Получение кода репозитория
       - name: Checkout code
@@ -45,30 +79,27 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable # Используем стабильную версию Rust
-          targets: ${{ matrix.target }} # Устанавливаем нужный target для кросс-компиляции или нативной сборки
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
       # 3. Установка системных зависимостей (только для Linux)
-      #    Необходимо для iced и rfd (GUI, диалоги, шрифты и т.д.)
       - name: Install Linux dependencies
-        if: runner.os == 'Linux' # Выполняем только на Linux раннере
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libgtk-3-dev libudev-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libfontconfig1-dev libssl-dev
 
-      # 4. Кеширование зависимостей Cargo (ускоряет сборку)
+      # 4. Кеширование зависимостей Cargo
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # Кешируем отдельно для каждой ОС и target'а
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release
 
       # 5. Сборка приложения в release режиме
       - name: Build application
         run: cargo build --verbose --release --target ${{ matrix.target }}
 
-      # 6. Подготовка артефактов для загрузки
-      #    Копируем скомпилированный бинарник в отдельную папку 'staging'
+      # 6. Подготовка артефактов для загрузки в релиз
       - name: Create staging directory
         run: mkdir staging
 
@@ -80,8 +111,7 @@ jobs:
         if: runner.os == 'Windows'
         run: copy target\${{ matrix.target }}\release\${{ matrix.binary_name }} staging\
 
-      # Копирование иконки и создание .desktop файла (только Linux)
-      - name: Prepare Desktop Entry (Linux)
+      - name: Prepare Desktop Entry & Icon (Linux)
         if: runner.os == 'Linux'
         run: |
           cp src/assets/${{ matrix.icon_name }} staging/
@@ -97,10 +127,65 @@ jobs:
           echo "Categories=Utility;Network;" >> "$DESKTOP_FILE"
           echo "Copied icon and created .desktop file"
 
-      # 7. Загрузка артефактов сборки
-      #    Сохраняем содержимое папки 'staging' как артефакт воркфлоу
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      # 7. Загрузка ассетов в релиз (только при пуше в master)
+      - name: Upload Binary Asset
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: ${{ matrix.artifact_name }} # Имя артефакта (linux-release или windows-release)
-          path: staging/ # Загружаем все содержимое папки staging
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
+          asset_path: staging/${{ matrix.binary_name }}
+          asset_name: ${{ env.CRATE_NAME }}-${{ env.BRANCH_NAME }}-${{ env.SHORT_SHA }}-${{ matrix.platform_suffix }} # Имя ассета с веткой и хешем
+          asset_content_type: application/octet-stream
+
+      - name: Upload Desktop File (Linux)
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master на Linux
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
+          asset_path: staging/${{ env.CRATE_NAME }}.desktop
+          asset_name: ${{ env.CRATE_NAME }}.desktop
+          asset_content_type: application/x-desktop
+
+      - name: Upload Icon File (Linux)
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/master' # Загружаем только для пуша в master на Linux
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
+          asset_path: staging/${{ matrix.icon_name }}
+          asset_name: ${{ matrix.icon_name }}
+          asset_content_type: image/png
+
+  publish_release:
+    name: Publish Release
+    needs: build_release_assets # Запускаем после сборки и загрузки всех ассетов
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Запускаем только при пуше в master
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Нужно право на запись для изменения статуса релиза
+    steps:
+      - name: Publish the release draft
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { repo, owner } = context.repo;
+            const release = await github.rest.repos.getReleaseByTag({
+              owner,
+              repo,
+              tag: process.env.GITHUB_SHA
+            });
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.data.id,
+              draft: false
+            });
+            console.log(`Published release for commit ${process.env.GITHUB_SHA}`);
+        env:
+          GITHUB_SHA: ${{ github.sha }}

@@ -1,5 +1,4 @@
-// src/main.rs
-// Объявляем модули нашего приложения
+#![windows_subsystem = "windows"]
 mod process;
 mod settings;
 mod ui;
@@ -10,7 +9,7 @@ use iced::widget::container;
 use iced::{
     clipboard, event,
     window::{self, icon},
-    Alignment, Application, Color, Command, Element, Event, Length, Settings, Subscription, Theme,
+    Application, Command, Element, Event, Length, Settings, Subscription, Theme,
 };
 use image;
 use rfd::AsyncFileDialog; // Для диалога выбора файла
@@ -19,7 +18,7 @@ use std::{collections::VecDeque, path::PathBuf}; // Для очереди лог
 // Импортируем элементы из наших модулей
 use process::{kill_process, ProcessListener}; // Функции и типы для работы с процессом
 use settings::{get_config_path, load_settings, save_settings, AppSettings}; // Функции и типы для настроек
-use ui::{add_log_impl, view_main, view_settings, AnsiSegment, MAX_LOG_LINES}; // Функции, типы и константы UI
+use ui::{AnsiSegment, MAX_LOG_LINES}; // Функции, типы и константы UI
 
 // --- Состояние приложения ---
 // Основная структура, хранящая все состояние лаунчера
@@ -417,40 +416,59 @@ impl Application for Launcher {
 
             // --- Обработка общих событий Iced ---
             Message::EventOccurred(event) => {
-                if let Event::Window(id, window::Event::CloseRequested) = event {
-                    if id == window::Id::MAIN {
-                        println!(
-                            "[EventOccurred] Окно - главное (MAIN). Запускаем логику закрытия."
-                        );
-                        self.add_log("Получен запрос на закрытие окна...".to_string());
-                        self.close_requested = true;
-                        if self.is_running {
-                            if let Some(pid) = self.actual_pid {
-                                // Не используем .take() здесь
-                                self.add_log(format!(
-                                    "Инициирована остановка процесса (PID: {}) перед закрытием.",
-                                    pid
-                                ));
-                                // Очищаем сохраненный PID и сохраняем настройки
-                                if self.settings.last_pid.is_some() {
-                                    self.settings.last_pid = None;
-                                    commands_to_batch.push(Command::perform(
-                                        save_settings(
-                                            self.config_path.clone(),
-                                            self.settings.clone(),
-                                        ),
-                                        Message::SettingsSaved,
+                match event {
+                    // Обработка запроса на закрытие окна
+                    Event::Window(id, window::Event::CloseRequested) => {
+                        if id == window::Id::MAIN {
+                            println!(
+                                "[EventOccurred] Окно - главное (MAIN). Запускаем логику закрытия."
+                            );
+                            self.add_log("Получен запрос на закрытие окна...".to_string());
+                            self.close_requested = true;
+                            if self.is_running {
+                                if let Some(pid) = self.actual_pid {
+                                    // Не используем .take() здесь
+                                    self.add_log(format!(
+                                        "Инициирована остановка процесса (PID: {}) перед закрытием.",
+                                        pid
                                     ));
+                                    // Очищаем сохраненный PID и сохраняем настройки
+                                    if self.settings.last_pid.is_some() {
+                                        self.settings.last_pid = None;
+                                        commands_to_batch.push(Command::perform(
+                                            save_settings(
+                                                self.config_path.clone(),
+                                                self.settings.clone(),
+                                            ),
+                                            Message::SettingsSaved,
+                                        ));
+                                    }
+                                    commands_to_batch.push(Command::perform(
+                                        kill_process(pid),
+                                        Message::ProcessKillResult,
+                                    ));
+                                } else {
+                                    self.add_log(
+                                        "Процесс был запущен, но PID не найден. Закрытие окна."
+                                            .to_string(),
+                                    );
+                                    // На всякий случай очищаем и сохраняем, если PID был
+                                    if self.settings.last_pid.is_some() {
+                                        self.settings.last_pid = None;
+                                        commands_to_batch.push(Command::perform(
+                                            save_settings(
+                                                self.config_path.clone(),
+                                                self.settings.clone(),
+                                            ),
+                                            Message::SettingsSaved,
+                                        ));
+                                    }
+                                    self.is_running = false;
+                                    self.subscription_id = None;
+                                    commands_to_batch.push(window::close(window::Id::MAIN));
                                 }
-                                commands_to_batch.push(Command::perform(
-                                    kill_process(pid),
-                                    Message::ProcessKillResult,
-                                ));
                             } else {
-                                self.add_log(
-                                    "Процесс был запущен, но PID не найден. Закрытие окна."
-                                        .to_string(),
-                                );
+                                println!("[EventOccurred] Процесс не запущен. Запрос на немедленное закрытие.");
                                 // На всякий случай очищаем и сохраняем, если PID был
                                 if self.settings.last_pid.is_some() {
                                     self.settings.last_pid = None;
@@ -462,26 +480,26 @@ impl Application for Launcher {
                                         Message::SettingsSaved,
                                     ));
                                 }
-                                self.is_running = false;
-                                self.subscription_id = None;
+                                self.add_log("Процесс не запущен. Закрытие окна.".to_string());
                                 commands_to_batch.push(window::close(window::Id::MAIN));
                             }
                         } else {
-                            println!("[EventOccurred] Процесс не запущен. Запрос на немедленное закрытие.");
-                            // На всякий случай очищаем и сохраняем, если PID был
-                            if self.settings.last_pid.is_some() {
-                                self.settings.last_pid = None;
-                                commands_to_batch.push(Command::perform(
-                                    save_settings(self.config_path.clone(), self.settings.clone()),
-                                    Message::SettingsSaved,
-                                ));
-                            }
-                            self.add_log("Процесс не запущен. Закрытие окна.".to_string());
-                            commands_to_batch.push(window::close(window::Id::MAIN));
+                            println!("[EventOccurred] Окно ID {:?} не является главным (MAIN). Игнорируем запрос.", id);
                         }
-                    } else {
-                        println!("[EventOccurred] Окно ID {:?} не является главным (MAIN). Игнорируем запрос.", id);
                     }
+                    // Обработка вставки из буфера обмена
+                    // Event::Keyboard(content) => {
+                    //     if self.show_settings {
+                    //         self.settings.api_key = content;
+                    //         commands_to_batch.push(Command::perform(
+                    //             save_settings(self.config_path.clone(), self.settings.clone()),
+                    //             Message::SettingsSaved,
+                    //         ));
+                    //         self.add_log("API ключ вставлен из буфера обмена.".to_string());
+                    //     }
+                    // }
+                    // Игнорируем остальные события окна и клавиатуры/мыши в этом глобальном обработчике
+                    _ => {}
                 }
             }
         }
