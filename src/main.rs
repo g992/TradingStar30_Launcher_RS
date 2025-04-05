@@ -1,3 +1,4 @@
+use ansi_parser::{AnsiParser, AnsiSequence, Output};
 use directories_next::ProjectDirs;
 use iced::executor;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
@@ -45,11 +46,19 @@ impl Default for AppSettings {
     }
 }
 
+// --- Структура для сегмента ANSI ---
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnsiSegment {
+    text: String,
+    color: Option<Color>,
+    // Можно добавить другие атрибуты стиля (жирный, подчеркнутый), если нужно
+}
+
 // --- Состояние приложения ---
 pub struct Launcher {
     settings: AppSettings,
     is_running: bool,
-    logs: VecDeque<String>,
+    logs: VecDeque<Vec<AnsiSegment>>,
     show_settings: bool,
     config_path: Option<PathBuf>,
     subscription_id_counter: u64,
@@ -247,6 +256,34 @@ async fn kill_process(pid: u32) -> Result<(), String> {
         let error_msg = "Остановка процесса не поддерживается на этой ОС.".to_string();
         println!("[kill_process] {}", error_msg);
         Err(error_msg)
+    }
+}
+
+// --- Вспомогательная функция для конвертации ANSI цвета ---
+fn ansi_to_iced_color(code: u8) -> Color {
+    match code {
+        // Стандартные цвета
+        30 => Color::BLACK,                       // Black
+        31 => Color::from_rgb8(0xCD, 0x5C, 0x5C), // Red (IndianRed)
+        32 => Color::from_rgb8(0x90, 0xEE, 0x90), // Green (LightGreen)
+        33 => Color::from_rgb8(0xFF, 0xD7, 0x00), // Yellow (Gold)
+        34 => Color::from_rgb8(0x46, 0x82, 0xB4), // Blue (SteelBlue)
+        35 => Color::from_rgb8(0xBA, 0x55, 0xD3), // Magenta (MediumOrchid)
+        36 => Color::from_rgb8(0x40, 0xE0, 0xD0), // Cyan (Turquoise)
+        37 => Color::from_rgb8(0xD3, 0xD3, 0xD3), // White (LightGray)
+        // Яркие цвета (часто используются)
+        90 => Color::from_rgb8(0x80, 0x80, 0x80), // Bright Black (Gray)
+        91 => Color::from_rgb8(0xFF, 0x00, 0x00), // Bright Red
+        92 => Color::from_rgb8(0x00, 0xFF, 0x00), // Bright Green (Lime)
+        93 => Color::from_rgb8(0xFF, 0xFF, 0x00), // Bright Yellow
+        94 => Color::from_rgb8(0x00, 0x00, 0xFF), // Bright Blue
+        95 => Color::from_rgb8(0xFF, 0x00, 0xFF), // Bright Magenta (Fuchsia)
+        96 => Color::from_rgb8(0x00, 0xFF, 0xFF), // Bright Cyan (Aqua)
+        97 => Color::WHITE,                       // Bright White
+        // Сброс (используем цвет по умолчанию - None в AnsiSegment)
+        0 | 39 | 49 => Color::WHITE, // Treat reset like default terminal color
+        // Другие коды пока игнорируем или возвращаем белый
+        _ => Color::WHITE,
     }
 }
 
@@ -628,12 +665,82 @@ impl Application for Launcher {
 
 impl Launcher {
     fn add_log(&mut self, message: String) {
-        println!("LOG: {}", message);
-        let clean_message = message.replace(|c: char| c.is_control(), "");
+        println!("RAW LOG: {}", message);
+
+        let mut segments = Vec::new();
+        let mut current_color: Option<Color> = None;
+        let mut current_text = String::new();
+
+        for block in message.ansi_parse() {
+            match block {
+                Output::TextBlock(text) => {
+                    current_text.push_str(text);
+                }
+                Output::Escape(sequence) => {
+                    if let AnsiSequence::SetGraphicsMode(codes) = sequence {
+                        if codes.is_empty() {
+                            if !current_text.is_empty() {
+                                segments.push(AnsiSegment {
+                                    text: std::mem::take(&mut current_text),
+                                    color: current_color,
+                                });
+                            }
+                            current_color = None;
+                        } else {
+                            for code in codes {
+                                match code {
+                                    0 => {
+                                        if !current_text.is_empty() {
+                                            segments.push(AnsiSegment {
+                                                text: std::mem::take(&mut current_text),
+                                                color: current_color,
+                                            });
+                                        }
+                                        current_color = None;
+                                    }
+                                    30..=37 | 90..=97 => {
+                                        if !current_text.is_empty() {
+                                            segments.push(AnsiSegment {
+                                                text: std::mem::take(&mut current_text),
+                                                color: current_color,
+                                            });
+                                        }
+                                        current_color = Some(ansi_to_iced_color(code));
+                                    }
+                                    39 => {
+                                        if !current_text.is_empty() {
+                                            segments.push(AnsiSegment {
+                                                text: std::mem::take(&mut current_text),
+                                                color: current_color,
+                                            });
+                                        }
+                                        current_color = None;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !current_text.is_empty() {
+            segments.push(AnsiSegment {
+                text: current_text,
+                color: current_color,
+            });
+        }
+
+        segments.retain(|seg| !seg.text.is_empty());
+
         if self.logs.len() >= MAX_LOG_LINES {
             self.logs.pop_front();
         }
-        self.logs.push_back(clean_message);
+        if !segments.is_empty() {
+            println!("PARSED LOG: {:?}", segments);
+            self.logs.push_back(segments);
+        }
     }
 
     fn view_main(&self) -> Element<Message> {
@@ -670,13 +777,25 @@ impl Launcher {
 
         let control_row = row![Space::with_width(Length::Fill), control_button_element].padding(10);
 
-        let log_content = self
+        let log_lines = self
             .logs
             .iter()
-            .cloned()
-            .collect::<Vec<String>>()
-            .join("\n");
-        let log_view = scrollable(text(log_content).size(12)).height(Length::Fill);
+            .fold(column![].spacing(2), |column, line_segments| {
+                let log_row = line_segments
+                    .iter()
+                    .fold(row![].spacing(0), |row_acc, segment| {
+                        let segment_text = text(&segment.text)
+                            .size(12)
+                            .font(iced::Font::MONOSPACE)
+                            .style(segment.color.unwrap_or(Color::WHITE));
+                        row_acc.push(segment_text)
+                    });
+                column.push(log_row)
+            });
+
+        let log_view = scrollable(log_lines)
+            .height(Length::Fill)
+            .width(Length::Fill);
 
         column![top_bar_container, control_row, log_view]
             .spacing(10)
