@@ -3,9 +3,9 @@ name: Build Rust Application
 # Триггеры запуска воркфлоу
 on:
   push:
-    branches: [ "main" ] # Запуск при пуше в main
+    branches: [ "master" ] # Запуск при пуше в master
   pull_request:
-    branches: [ "main" ] # Запуск при создании/обновлении PR к main
+    branches: [ "master" ] # Запуск при создании/обновлении PR к master
 
 env:
   # Имя вашего пакета (из Cargo.toml)
