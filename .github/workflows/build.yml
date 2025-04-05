@@ -27,21 +27,67 @@ jobs:
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }} # Передаем URL для загрузки ассетов
       release_id: ${{ steps.create_release.outputs.id }} # Передаем ID релиза
-    env:
-      SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
+      release_tag: ${{ steps.get_next_tag.outputs.next_tag }} # Передаем вычисленный тег
     steps:
+      # Шаг для вычисления следующего тега версии
+      - name: Get next release tag
+        id: get_next_tag
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { repo, owner } = context.repo;
+            let nextTag = 'v0.1.0'; // Версия по умолчанию
+
+            try {
+              // Получаем самый последний опубликованный релиз
+              const latestRelease = await github.rest.repos.getLatestRelease({ owner, repo });
+              const latestTag = latestRelease.data.tag_name;
+              console.log(`Latest published release tag: ${latestTag}`);
+
+              // Ищем тег в формате v0.<число>.число
+              const tagRegex = /^v0\.(\d+)\.\d+$/;
+              const match = latestTag.match(tagRegex);
+
+              if (match) {
+                const currentMinor = parseInt(match[1], 10);
+                const nextMinor = currentMinor + 1;
+                nextTag = `v0.${nextMinor}.0`; // Увеличиваем минорную, патч = 0
+                console.log(`Calculated next tag: ${nextTag}`);
+              } else {
+                console.log(`Latest tag '${latestTag}' does not match v0.x.y format. Using default ${nextTag}.`);
+              }
+            } catch (error) {
+              // Если релиза нет (404), используем версию по умолчанию
+              if (error.status === 404) {
+                console.log('No previous published releases found. Using default tag v0.1.0.');
+              } else {
+                // При других ошибках прерываем работу
+                console.error('Error fetching latest release:', error);
+                core.setFailed(`Failed to get latest release: ${error.message}`);
+                return;
+              }
+            }
+            // Передаем вычисленный тег в output шага
+            core.setOutput('next_tag', nextTag);
+
       - name: Create Release Draft
         id: create_release
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Используем короткий хеш коммита для тега и имени релиза, т.к. запускаемся на пуш
-          tag_name: ${{ github.sha }}
-          release_name: Release ${{ env.SHORT_SHA }}
-          body: 'Автоматически сгенерированный релиз для коммита ${{ github.sha }}' # Можно добавить генерацию changelog позже
+          # Используем вычисленный тег
+          tag_name: ${{ steps.get_next_tag.outputs.next_tag }}
+          # Имя релиза теперь включает версию
+          release_name: Release ${{ steps.get_next_tag.outputs.next_tag }}
+          # Исправляем многострочный body
+          body: |
+            Автоматически сгенерированный релиз для коммита ${{ github.sha }}.
+
+            **Важно:** Это черновик релиза. Отредактируйте описание при необходимости и опубликуйте вручную.
           draft: true # Создаем как черновик
-          prerelease: false
+          prerelease: false # Не пре-релиз
 
   build_release_assets:
     name: Build Release Asset (${{ matrix.os }})
@@ -50,9 +96,11 @@ jobs:
     permissions:
       contents: write
     env:
-      # Получаем имя ветки (master) и короткий хеш
-      BRANCH_NAME: ${{ github.ref_name }}
-      SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
+      # Получаем тег релиза из предыдущей джобы
+      RELEASE_TAG: ${{ needs.create_release.outputs.release_tag }}
+      # BRANCH_NAME и SHORT_SHA больше не нужны для имен ассетов
+      # BRANCH_NAME: ${{ github.ref_name }}
+      # SHORT_SHA: $(echo ${{ github.sha }} | cut -c1-7)
     strategy:
       matrix:
         include:
@@ -137,7 +185,8 @@ jobs:
         with:
           upload_url: ${{ needs.create_release.outputs.upload_url }}
           asset_path: staging/${{ matrix.binary_name }}
-          asset_name: ${{ env.CRATE_NAME }}-${{ env.BRANCH_NAME }}-${{ env.SHORT_SHA }}-${{ matrix.platform_suffix }} # Имя ассета с веткой и хешем
+          # Имя ассета теперь использует тег версии и корректно добавляет .exe для Windows
+          asset_name: ${{ env.CRATE_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.platform_suffix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           asset_content_type: application/octet-stream
 
       - name: Upload Desktop File (Linux)
@@ -161,28 +210,3 @@ jobs:
           asset_path: staging/${{ matrix.icon_name }}
           asset_name: ${{ matrix.icon_name }}
           asset_content_type: image/png
-
-  publish_release:
-    name: Publish Release
-    needs: [create_release, build_release_assets] # Добавляем зависимость от create_release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master' # Запускаем только при пуше в master
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # Нужно право на запись для изменения статуса релиза
-    steps:
-      - name: Publish the release draft
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const { repo, owner } = context.repo;
-            await github.rest.repos.updateRelease({
-              owner,
-              repo,
-              release_id: process.env.RELEASE_ID,
-              draft: false
-            });
-            console.log(`Published release for commit ${{ github.sha }}`);
-        env:
-          RELEASE_ID: ${{ needs.create_release.outputs.release_id }}
-          # GITHUB_SHA: ${{ github.sha }}
